@@ -1,18 +1,19 @@
 use std::{ffi::c_void, mem, time::Duration};
-use windows::Win32::System::JobObjects::{
-    JobObjectBasicAndIoAccountingInformation, JobObjectBasicProcessIdList,
-    QueryInformationJobObject, JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION,
-    JOBOBJECT_BASIC_PROCESS_ID_LIST,
+use windows::Win32::{
+    Foundation::ERROR_MORE_DATA,
+    System::JobObjects::{
+        JobObjectBasicAndIoAccountingInformation, JobObjectBasicProcessIdList,
+        QueryInformationJobObject, JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION,
+        JOBOBJECT_BASIC_PROCESS_ID_LIST,
+    },
 };
 
 use crate::{Job, JobError};
 
-#[repr(C)]
-#[derive(Debug)]
-struct ProcessIdList {
-    header: JOBOBJECT_BASIC_PROCESS_ID_LIST,
-    list: [usize; 1024],
-}
+const INITIAL_PROCESS_ID_CAPACITY: usize = 1024;
+
+const PROCESS_ID_LIST_OFFSET: usize =
+    mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList) / mem::size_of::<usize>();
 
 #[derive(Debug, Clone)]
 pub struct BasicAndIoAccountingInfo {
@@ -37,34 +38,41 @@ impl Job {
     /// If the job is nested, the process identifier list consists of all processes
     /// associated with the job and its child jobs.
     pub fn query_process_id_list(&self) -> Result<Vec<usize>, JobError> {
-        // TODO: We will get an error if there are more than 1024 processes in the job.
-        // This can be fixed by calling `QueryInformationJobObject` a second time,
-        // with a bigger list with the correct size (as returned from the first call).
-        let mut proc_id_list = ProcessIdList {
-            header: Default::default(),
-            list: [0usize; 1024],
-        };
+        let mut capacity = INITIAL_PROCESS_ID_CAPACITY;
 
-        unsafe {
-            QueryInformationJobObject(
-                Some(self.handle),
-                JobObjectBasicProcessIdList,
-                &mut proc_id_list as *mut _ as *mut c_void,
-                mem::size_of_val(&proc_id_list) as u32,
-                None,
-            )
+        loop {
+            let mut buffer = vec![0usize; PROCESS_ID_LIST_OFFSET + capacity];
+
+            let result = unsafe {
+                QueryInformationJobObject(
+                    Some(self.handle),
+                    JobObjectBasicProcessIdList,
+                    buffer.as_mut_ptr() as *mut c_void,
+                    mem::size_of_val(buffer.as_slice()) as u32,
+                    None,
+                )
+            };
+
+            let header = unsafe {
+                buffer
+                    .as_ptr()
+                    .cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>()
+                    .read()
+            };
+
+            match result {
+                Ok(()) => {
+                    let process_ids = &buffer[PROCESS_ID_LIST_OFFSET..];
+
+                    return Ok(process_ids[..header.NumberOfProcessIdsInList as usize].to_vec());
+                }
+                Err(e) if e.code() == ERROR_MORE_DATA.to_hresult() => {
+                    // WOW64 leaves NumberOfAssignedProcesses unset here, so grow at least twofold.
+                    capacity = (header.NumberOfAssignedProcesses as usize).max(2 * capacity);
+                }
+                Err(e) => return Err(JobError::GetInfoFailed(e.into())),
+            }
         }
-        .map_err(|e| JobError::GetInfoFailed(e.into()))?;
-
-        let list = proc_id_list
-            .header
-            .ProcessIdList
-            .into_iter()
-            .chain(proc_id_list.list)
-            .take(proc_id_list.header.NumberOfProcessIdsInList as usize)
-            .collect();
-
-        Ok(list)
     }
 
     /// Return basic accounting and I/O accounting information for a job object.
@@ -121,18 +129,26 @@ fn duration_from_ticks(ticks: i64) -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
-    use rusty_fork::rusty_fork_test;
-    use windows::Win32::System::{
-        JobObjects::{
-            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION,
-        },
-        Threading::IO_COUNTERS,
+    use std::{
+        os::windows::{io::AsRawHandle, process::CommandExt},
+        process::{Child, Command},
+        time::Duration,
     };
 
-    use super::{accounting_info, duration_from_ticks};
-    use crate::Job;
+    use rusty_fork::rusty_fork_test;
+    use windows::Win32::{
+        Foundation::HANDLE,
+        System::{
+            JobObjects::{
+                JOBOBJECT_BASIC_ACCOUNTING_INFORMATION,
+                JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION,
+            },
+            Threading::{CREATE_SUSPENDED, IO_COUNTERS},
+        },
+    };
+
+    use super::{accounting_info, duration_from_ticks, INITIAL_PROCESS_ID_CAPACITY};
+    use crate::{utils::get_current_process, ExtendedLimitInfo, Job, JobError};
 
     #[test]
     fn query_proc_id() {
@@ -153,7 +169,50 @@ mod tests {
         assert!(pids.contains(&current_process_id));
     }
 
+    #[test]
+    fn query_proc_id_fails_on_a_process_handle() {
+        let process = Job {
+            handle: HANDLE(get_current_process() as _),
+        };
+
+        assert!(matches!(
+            process.query_process_id_list(),
+            Err(JobError::GetInfoFailed(_))
+        ));
+    }
+
     rusty_fork_test! {
+        #[test]
+        fn query_proc_id_past_initial_capacity() {
+            let job =
+                Job::create_with_limit_info(ExtendedLimitInfo::new().limit_kill_on_job_close())
+                    .unwrap();
+            let program = std::env::current_exe().unwrap();
+
+            let children: Vec<Child> = (0..2 * INITIAL_PROCESS_ID_CAPACITY)
+                .map(|_| {
+                    let mut child = Command::new(&program)
+                        .creation_flags(CREATE_SUSPENDED.0)
+                        .spawn()
+                        .unwrap();
+                    job.assign_process(child.as_raw_handle() as isize)
+                        .inspect_err(|_| child.kill().unwrap())
+                        .unwrap();
+                    child
+                })
+                .collect();
+
+            let mut pids = job.query_process_id_list().unwrap();
+            assert_eq!(pids.capacity(), pids.len());
+            pids.sort_unstable();
+
+            let mut child_ids: Vec<usize> =
+                children.iter().map(|child| child.id() as usize).collect();
+            child_ids.sort_unstable();
+
+            assert_eq!(pids, child_ids);
+        }
+
         #[test]
         fn query_basic_and_io_accounting() {
             let job = Job::create().unwrap();
